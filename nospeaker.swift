@@ -573,8 +573,12 @@ func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
         fail("Couldn't allocate the audio decoder buffer.")
     }
     do {
-        while true {
-            try audio.read(into: buffer, frameCount: buffer.frameCapacity)
+        while audio.framePosition < audio.length {
+            // Some AVAudioFile decoders throw instead of returning zero at EOF.
+            // Never ask for more frames than the file reports remaining.
+            let remaining = audio.length - audio.framePosition
+            let requested = AVAudioFrameCount(min(Int64(buffer.frameCapacity), remaining))
+            try audio.read(into: buffer, frameCount: requested)
             let readCount = Int(buffer.frameLength)
             if readCount == 0 { break }
             guard let data = buffer.floatChannelData else { fail("Audio decoder didn't return floating-point PCM.") }
@@ -593,7 +597,7 @@ func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
             if consumed > 0 { pending.removeFirst(consumed) }
         }
     } catch {
-        fail("Couldn't decode audio samples: \(error.localizedDescription)")
+        fail("Couldn't decode audio samples at frame \(audio.framePosition)/\(audio.length): \(error.localizedDescription)")
     }
     guard totalSamples > 0 else { fail("Audio file is empty.") }
     // Zero-pad the end so a short recording (or the final notes) isn't lost.
