@@ -18,6 +18,7 @@
 // driven past its normal maximum.
 
 import AVFoundation
+import Accelerate
 import CoreAudio
 import Darwin
 import IOKit
@@ -26,6 +27,7 @@ import Foundation
 // MARK: - Run state, keys, clock
 
 var stopRequested = false
+var musicMode = false
 var skipRequested = false
 var keyPressed = false
 /// Leaving goes through the credits: the first Ctrl-C (or q, or esc) jumps there, the next one exits.
@@ -443,6 +445,203 @@ func voiceTones(_ f: Frame) -> [(hz: Double, amp: Double)] {
     let w = [f.amps[0], f.amps[1] * 1.8]
     let sum = max(w[0] + w[1], 1e-9)
     return [(f.formants[0], w[0] / sum), (f.formants[1], w[1] / sum)]
+}
+
+// MARK: - Experimental audio-file-to-haptics playback
+
+/// This is a spectral resynthesizer, NOT a PCM output device.  It converts short
+/// windows of decoded audio into a handful of simultaneous sine waves that the
+/// Force Touch actuator understands.  Expect lo-fi, buzzy, mono approximations.
+struct MusicFrame {
+    let tones: [(hz: Double, amp: Double)]
+    let rms: Double
+}
+
+struct MusicAnalysis {
+    let frames: [MusicFrame]
+    let frameSeconds: Double
+    let sourceSeconds: Double
+    let sourceSampleRate: Double
+}
+
+/// Select separated local spectral maxima instead of selecting adjacent FFT
+/// bins belonging to the same musical note. Bass below 100 Hz is octave-shifted
+/// into the trackpad's usable band; content above 3,950 Hz is discarded.
+func musicTones(powers: [Double], sampleRate: Double, fftSize: Int, count: Int) -> [(hz: Double, amp: Double)] {
+    let minBin = max(2, Int(65 * Double(fftSize) / sampleRate))
+    let maxBin = min(powers.count - 2, Int(3950 * Double(fftSize) / sampleRate))
+    guard minBin < maxBin else { return [] }
+    let strongest = (minBin...maxBin).map { powers[$0] }.max() ?? 0
+    guard strongest > 1e-12 else { return [] }
+
+    var candidates: [(hz: Double, amp: Double)] = []
+    for bin in minBin...maxBin {
+        let v = powers[bin]
+        guard v > strongest * 0.014, v > powers[bin - 1], v >= powers[bin + 1] else { continue }
+        // Parabolic peak interpolation makes notes more accurate than FFT-bin spacing.
+        let a = log(max(powers[bin - 1], 1e-20))
+        let b = log(max(v, 1e-20))
+        let c = log(max(powers[bin + 1], 1e-20))
+        let denom = a - 2 * b + c
+        let offset = abs(denom) > 1e-12 ? max(-0.5, min(0.5, 0.5 * (a - c) / denom)) : 0
+        var freq = (Double(bin) + offset) * sampleRate / Double(fftSize)
+        while freq < 100 { freq *= 2 }
+        guard freq <= 3950 else { continue }
+        // The glass tends to radiate midrange notes more effectively than deep bass.
+        let midrange = exp(-pow(log2(freq / 1100) / 1.8, 2))
+        candidates.append((freq, sqrt(v) * (0.75 + 0.25 * midrange)))
+    }
+    candidates.sort { $0.amp > $1.amp }
+    var picked: [(hz: Double, amp: Double)] = []
+    for candidate in candidates {
+        guard !picked.contains(where: { abs(log2(candidate.hz / $0.hz)) < 0.055 }) else { continue }
+        picked.append(candidate)
+        if picked.count == count { break }
+    }
+    return picked
+}
+
+/// Decode in bounded chunks. Keep only a small sliding PCM window in memory;
+/// store compact spectral frames for deterministic, clocked playback afterward.
+func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
+    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        usageError("No audio file at \"\(path)\".")
+    }
+    let audio: AVAudioFile
+    do {
+        audio = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+    } catch {
+        fail("Can't decode \"\(path)\": \(error.localizedDescription)\nTry an ordinary WAV, MP3, M4A, or AIFF file.",
+             headline: "nospeaker couldn't open that audio file.")
+    }
+    let rate = audio.processingFormat.sampleRate
+    let channels = Int(audio.processingFormat.channelCount)
+    guard rate >= 8000, rate <= 192000, channels > 0, channels <= 32 else {
+        fail("Unsupported audio format: \(rate) Hz, \(channels) channels.")
+    }
+    let n = 1 << Int(ceil(log2(rate * 0.08)))  // ~80-160 ms: enough resolution for bass
+    let log2n = vDSP_Length(Int(log2(Double(n))))
+    guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
+        fail("Accelerate couldn't initialize the audio spectrum analyzer.")
+    }
+    defer { vDSP_destroy_fftsetup(setup) }
+    let hopSamples = max(1, Int((rate * 0.020).rounded()))
+    let window = (0..<n).map { Float(0.5 - 0.5 * cos(2 * .pi * Double($0) / Double(n - 1))) }
+    var windowed = [Float](repeating: 0, count: n)
+    var real = [Float](repeating: 0, count: n / 2)
+    var imag = [Float](repeating: 0, count: n / 2)
+    var pending: [Float] = []
+    var result: [MusicFrame] = []
+    var totalSamples = 0
+
+    func analyzeWindow(_ start: Int) -> MusicFrame {
+        var energy = 0.0
+        for j in 0..<n {
+            let value = start + j < pending.count ? pending[start + j] : 0
+            energy += Double(value) * Double(value)
+            windowed[j] = value * window[j]
+        }
+        let chosen = real.withUnsafeMutableBufferPointer { rp in
+            imag.withUnsafeMutableBufferPointer { ip in
+                var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+                windowed.withUnsafeBufferPointer { input in
+                    input.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n / 2) { complex in
+                        vDSP_ctoz(complex, 2, &split, 1, vDSP_Length(n / 2))
+                    }
+                }
+                vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+                var powers = [Double](repeating: 0, count: n / 2)
+                if powers.count > 1 {
+                    for k in 1..<powers.count {
+                        powers[k] = Double(split.realp[k]) * Double(split.realp[k])
+                                  + Double(split.imagp[k]) * Double(split.imagp[k])
+                    }
+                }
+                return musicTones(powers: powers, sampleRate: rate, fftSize: n, count: tones)
+            }
+        }
+        return MusicFrame(tones: chosen, rms: sqrt(energy / Double(n)))
+    }
+
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: audio.processingFormat, frameCapacity: 16384) else {
+        fail("Couldn't allocate the audio decoder buffer.")
+    }
+    do {
+        while true {
+            try audio.read(into: buffer, frameCount: buffer.frameCapacity)
+            let readCount = Int(buffer.frameLength)
+            if readCount == 0 { break }
+            guard let data = buffer.floatChannelData else { fail("Audio decoder didn't return floating-point PCM.") }
+            for i in 0..<readCount {
+                var mono: Float = 0
+                for channel in 0..<channels { mono += data[channel][i] / Float(channels) }
+                pending.append(mono.isFinite ? mono : 0)
+            }
+            totalSamples += readCount
+            // Keeping the unprocessed tail preserves overlap between successive FFT windows.
+            var consumed = 0
+            while pending.count - consumed >= n {
+                result.append(analyzeWindow(consumed))
+                consumed += hopSamples
+            }
+            if consumed > 0 { pending.removeFirst(consumed) }
+        }
+    } catch {
+        fail("Couldn't decode audio samples: \(error.localizedDescription)")
+    }
+    guard totalSamples > 0 else { fail("Audio file is empty.") }
+    // Zero-pad the end so a short recording (or the final notes) isn't lost.
+    while !pending.isEmpty {
+        result.append(analyzeWindow(0))
+        pending.removeFirst(min(hopSamples, pending.count))
+    }
+    return MusicAnalysis(frames: result, frameSeconds: Double(hopSamples) / rate,
+                         sourceSeconds: Double(totalSamples) / rate, sourceSampleRate: rate)
+}
+
+/// The playback level stays below the normal actuator maximum. The original
+/// driver does not provide phase-continuous PCM streaming, so each 20 ms chunk
+/// is deliberately a short, bounded actuation.
+func playMusic(_ track: MusicAnalysis, path: String, level: Float) {
+    guard !track.frames.isEmpty else { return }
+    let sorted = track.frames.map { $0.rms }.sorted()
+    let reference = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))]
+    guard reference > 1e-8 else {
+        print("The file is silent; nothing to vibrate.")
+        return
+    }
+    print("Playing through the trackpad: \((path as NSString).lastPathComponent)")
+    print(String(format: "%.1f s, %.0f Hz source, %d spectral frames. Ctrl-C to stop.",
+                 track.sourceSeconds, track.sourceSampleRate, track.frames.count))
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+    let started = mach_absolute_time()
+    for (index, frame) in track.frames.enumerated() {
+        if stopRequested { break }
+        waitUntil(started + UInt64(Double(index) * track.frameSeconds * ticksPerSecond))
+        if stopRequested { break }
+        let ratio = min(1, frame.rms / reference)
+        if ratio < 0.012 || frame.tones.isEmpty { continue }
+        let strength = Float(Double(level) * pow(ratio, 0.60))
+        play(frame.tones, ms: track.frameSeconds * 1000 * 0.95, level: strength)
+    }
+    if !stopRequested {
+        waitUntil(started + UInt64(Double(track.frames.count) * track.frameSeconds * ticksPerSecond))
+    }
+    print(stopRequested ? "Stopped." : "Finished.")
+}
+
+/// A decode/FFT smoke-test that does not require any trackpad or private API.
+func describeMusic(_ track: MusicAnalysis) {
+    let active = track.frames.filter { $0.rms > 1e-6 && !$0.tones.isEmpty }
+    print(String(format: "Audio: %.2f s, %.0f Hz; %d FFT frames, %d with spectral peaks.",
+                 track.sourceSeconds, track.sourceSampleRate, track.frames.count, active.count))
+    if let first = active.first, let peak = first.tones.first {
+        print(String(format: "First dominant frequency: %.1f Hz", peak.hz))
+        print("First frame tones: " + first.tones.map { String(format: "%.1f", $0.hz) }.joined(separator: ", ") + " Hz")
+    } else {
+        print("No audible spectral peaks detected.")
+    }
 }
 
 // MARK: - Live state shared with the screen
@@ -1533,6 +1732,10 @@ if flag("--help") || flag("-h") {
       nospeaker                         the show (space skips a part, q goes to the end)
       nospeaker "any words"             just say something
       nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
+      nospeaker --play song.mp3         play an audio file via the trackpad (experimental)
+      nospeaker --analyze song.wav      analyze audio without a trackpad
+      --tones 4                        number of simultaneous spectral tones (1–6)
+      --level 0.40                     playback level (0.05–0.60)
       --voice Daniel                    any voice from `say -v '?'`
       --dark                            white on black instead of black on white
       --plain                           no visuals
@@ -1550,16 +1753,52 @@ if let v = voiceName, !voiceExists(v) {
 applyTheme(light: !flag("--dark"))
 let plain = flag("--plain")
 let wantsSweep = flag("--sweep")
+let playPath = option("--play", example: "song.mp3")
+let analyzePath = option("--analyze", example: "song.wav")
+let tonesText = option("--tones", example: "4")
+let levelText = option("--level", example: "0.40")
 if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
 
-signal(SIGINT) { _ in requestEnd() }
+if playPath != nil && analyzePath != nil { usageError("Choose either --play or --analyze, not both.") }
+if (playPath != nil || analyzePath != nil) && wantsSweep { usageError("--sweep can't be mixed with audio-file mode.") }
+if (playPath == nil && analyzePath == nil) && (tonesText != nil || levelText != nil) {
+    usageError("--tones and --level require --play or --analyze.")
+}
+if analyzePath != nil && levelText != nil { usageError("--level is only used with --play.") }
+if (playPath != nil || analyzePath != nil) && !args.isEmpty {
+    usageError("Supply just one audio-file path, quoted if it contains spaces.")
+}
+let toneCount: Int
+if let text = tonesText {
+    guard let count = Int(text), (1...6).contains(count) else { usageError("--tones must be an integer from 1 to 6.") }
+    toneCount = count
+} else { toneCount = 4 }
+let musicLevel: Float
+if let text = levelText {
+    guard let value = Float(text), value.isFinite, (0.05...0.60).contains(value) else {
+        usageError("--level must be a number between 0.05 and 0.60.")
+    }
+    musicLevel = value
+} else { musicLevel = 0.40 }
+
+musicMode = playPath != nil
+signal(SIGINT) { _ in if musicMode { stopRequested = true } else { requestEnd() } }
 signal(SIGTERM) { _ in stopRequested = true }
 atexit { restoreTerminal() }
+
+// Analysis is deliberately available without a Force Touch trackpad.
+if let analyzePath {
+    describeMusic(analyseMusicFile(analyzePath, tones: toneCount))
+    exit(0)
+}
+let preparedMusic = playPath.map { analyseMusicFile($0, tones: toneCount) }
 
 motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
 
-if wantsSweep || !args.isEmpty {
+if let playPath, let preparedMusic {
+    playMusic(preparedMusic, path: playPath, level: musicLevel)
+} else if wantsSweep || !args.isEmpty {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
     if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
     if !args.isEmpty {
