@@ -464,10 +464,49 @@ struct MusicAnalysis {
     let sourceSampleRate: Double
 }
 
+/// Frequency profiles change spectral peak ranking and relative tone amplitudes,
+/// not the actuator's total drive. The "original" profile preserves the first
+/// audio-player implementation for reproducible A/B listening.
+enum MusicEQ: String {
+    case flat, original, trackpad
+}
+
+/// Coarse, deliberately conservative audibility *heuristic*, not a measured EQ.
+/// The upstream README shows a microphone measurement across 98-3951 Hz, but
+/// publishes an ASCII plot rather than individual dB samples. It reports the
+/// clearest/loudest region near 1 kHz. Different trackpads will differ.
+/// Never interpret these values as power multipliers or inverse-EQ gains.
+let trackpadAudibilityAnchors: [(hz: Double, weight: Double)] = [
+    (100, 0.45), (180, 0.50), (300, 0.55), (440, 0.58),
+    (620, 0.75), (850, 0.95), (1050, 1.00), (1500, 0.90),
+    (2100, 0.78), (3000, 0.65), (3950, 0.50),
+]
+
+func musicFrequencyWeight(_ hz: Double, eq: MusicEQ) -> Double {
+    switch eq {
+    case .flat:
+        return 1.0
+    case .original:
+        let midrange = exp(-pow(log2(hz / 1100) / 1.8, 2))
+        return 0.75 + 0.25 * midrange
+    case .trackpad:
+        if hz <= trackpadAudibilityAnchors[0].hz { return trackpadAudibilityAnchors[0].weight }
+        for i in 1..<trackpadAudibilityAnchors.count {
+            let upper = trackpadAudibilityAnchors[i]
+            if hz <= upper.hz {
+                let lower = trackpadAudibilityAnchors[i - 1]
+                let fraction = log2(hz / lower.hz) / log2(upper.hz / lower.hz)
+                return lower.weight + (upper.weight - lower.weight) * fraction
+            }
+        }
+        return trackpadAudibilityAnchors[trackpadAudibilityAnchors.count - 1].weight
+    }
+}
+
 /// Select separated local spectral maxima instead of selecting adjacent FFT
 /// bins belonging to the same musical note. Bass below 100 Hz is octave-shifted
 /// into the trackpad's usable band; content above 3,950 Hz is discarded.
-func musicTones(powers: [Double], sampleRate: Double, fftSize: Int, count: Int) -> [(hz: Double, amp: Double)] {
+func musicTones(powers: [Double], sampleRate: Double, fftSize: Int, count: Int, eq: MusicEQ) -> [(hz: Double, amp: Double)] {
     let minBin = max(2, Int(65 * Double(fftSize) / sampleRate))
     let maxBin = min(powers.count - 2, Int(3950 * Double(fftSize) / sampleRate))
     guard minBin < maxBin else { return [] }
@@ -487,9 +526,10 @@ func musicTones(powers: [Double], sampleRate: Double, fftSize: Int, count: Int) 
         var freq = (Double(bin) + offset) * sampleRate / Double(fftSize)
         while freq < 100 { freq *= 2 }
         guard freq <= 3950 else { continue }
-        // The glass tends to radiate midrange notes more effectively than deep bass.
-        let midrange = exp(-pow(log2(freq / 1100) / 1.8, 2))
-        candidates.append((freq, sqrt(v) * (0.75 + 0.25 * midrange)))
+        // Favor peaks the trackpad is more likely to radiate audibly.
+        // play() later normalizes the chosen amplitudes: this cannot overdrive
+        // the actuator, and a single-tone frame remains at its usual level.
+        candidates.append((freq, sqrt(v) * musicFrequencyWeight(freq, eq: eq)))
     }
     candidates.sort { $0.amp > $1.amp }
     var picked: [(hz: Double, amp: Double)] = []
@@ -503,7 +543,7 @@ func musicTones(powers: [Double], sampleRate: Double, fftSize: Int, count: Int) 
 
 /// Decode in bounded chunks. Keep only a small sliding PCM window in memory;
 /// store compact spectral frames for deterministic, clocked playback afterward.
-func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
+func analyseMusicFile(_ path: String, tones: Int, eq: MusicEQ) -> MusicAnalysis {
     let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
     guard FileManager.default.fileExists(atPath: url.path) else {
         usageError("No audio file at \"\(path)\".")
@@ -563,7 +603,7 @@ func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
                                   + Double(split.imagp[k]) * Double(split.imagp[k])
                     }
                 }
-                return musicTones(powers: powers, sampleRate: rate, fftSize: n, count: tones)
+                return musicTones(powers: powers, sampleRate: rate, fftSize: n, count: tones, eq: eq)
             }
         }
         return MusicFrame(tones: chosen, rms: sqrt(energy / Double(n)))
@@ -1776,6 +1816,7 @@ if flag("--help") || flag("-h") {
       nospeaker --analyze song.wav      analyze audio without a trackpad
       --tones 4                        number of simultaneous spectral tones (1–6)
       --level 0.40                     playback level (0.05–0.60)
+      --eq original                    peak weighting: original, flat, trackpad
       --voice Daniel                    any voice from `say -v '?'`
       --dark                            white on black instead of black on white
       --plain                           no visuals
@@ -1797,12 +1838,13 @@ let playPath = option("--play", example: "song.mp3")
 let analyzePath = option("--analyze", example: "song.wav")
 let tonesText = option("--tones", example: "4")
 let levelText = option("--level", example: "0.40")
+let eqText = option("--eq", example: "trackpad")
 if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
 
 if playPath != nil && analyzePath != nil { usageError("Choose either --play or --analyze, not both.") }
 if (playPath != nil || analyzePath != nil) && wantsSweep { usageError("--sweep can't be mixed with audio-file mode.") }
-if (playPath == nil && analyzePath == nil) && (tonesText != nil || levelText != nil) {
-    usageError("--tones and --level require --play or --analyze.")
+if (playPath == nil && analyzePath == nil) && (tonesText != nil || levelText != nil || eqText != nil) {
+    usageError("--tones, --level and --eq require --play or --analyze.")
 }
 if analyzePath != nil && levelText != nil { usageError("--level is only used with --play.") }
 if (playPath != nil || analyzePath != nil) && !args.isEmpty {
@@ -1813,6 +1855,13 @@ if let text = tonesText {
     guard let count = Int(text), (1...6).contains(count) else { usageError("--tones must be an integer from 1 to 6.") }
     toneCount = count
 } else { toneCount = 4 }
+let musicEQ: MusicEQ
+if let text = eqText {
+    guard let selected = MusicEQ(rawValue: text) else {
+        usageError("--eq must be original, flat, or trackpad.")
+    }
+    musicEQ = selected
+} else { musicEQ = .original }
 let musicLevel: Float
 if let text = levelText {
     guard let value = Float(text), value.isFinite, (0.05...0.60).contains(value) else {
@@ -1828,10 +1877,10 @@ atexit { restoreTerminal() }
 
 // Analysis is deliberately available without a Force Touch trackpad.
 if let analyzePath {
-    describeMusic(analyseMusicFile(analyzePath, tones: toneCount))
+    describeMusic(analyseMusicFile(analyzePath, tones: toneCount, eq: musicEQ))
     exit(0)
 }
-let preparedMusic = playPath.map { analyseMusicFile($0, tones: toneCount) }
+let preparedMusic = playPath.map { analyseMusicFile($0, tones: toneCount, eq: musicEQ) }
 
 motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
