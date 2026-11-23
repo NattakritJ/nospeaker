@@ -597,7 +597,27 @@ func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
             if consumed > 0 { pending.removeFirst(consumed) }
         }
     } catch {
-        fail("Couldn't decode audio samples at frame \(audio.framePosition)/\(audio.length): \(error.localizedDescription)")
+        let nsError = error as NSError
+        let at = audio.framePosition
+        let expected = audio.length
+        let unread = max(Int64(0), expected - at)
+        // Compressed formats can overestimate decoded PCM length by a few
+        // packets (encoder padding, gapless metadata, and VBR duration rounding).
+        // Accept eofErr only after real samples were decoded and near the end.
+        // An early eofErr is still a decoding failure, not a successful song.
+        let tailAllowance = max(Int64(buffer.frameCapacity), Int64((rate * 0.4).rounded()))
+        let nearEnd = at >= expected - tailAllowance && at >= expected * 9 / 10
+        if nsError.code == -39 && totalSamples > 0 && nearEnd {
+            let notice = "nospeaker: audio decoder reached EOF with \(unread) estimated frames remaining; using \(totalSamples) decoded frames.\n"
+            FileHandle.standardError.write(Data(notice.utf8))
+        } else {
+            fail("""
+                Couldn't decode audio samples at frame \(at)/\(expected): \(error.localizedDescription) [\(nsError.domain): \(nsError.code)].
+                If this is a compressed or damaged file, try converting it with:
+                  afconvert -f WAVE -d LEI16 "input.mp3" "converted.wav"
+                Then use --analyze or --play with "converted.wav".
+                """, headline: "nospeaker couldn't finish decoding that audio file.")
+        }
     }
     guard totalSamples > 0 else { fail("Audio file is empty.") }
     // Zero-pad the end so a short recording (or the final notes) isn't lost.
