@@ -52,6 +52,17 @@ for name in a440-aac.m4a a440-alac.m4a; do
     }
 done
 
+# Exercise the compressed-audio decoder; MP4/AAC duration may be an estimate.
+if command -v afconvert >/dev/null 2>&1; then
+    afconvert -f m4af -d aac -b 96000 "$work/a440.wav" "$work/a440.m4a"
+    compressed=$(./nospeaker --analyze "$work/a440.m4a")
+    printf '%s\\n' "$compressed"
+    printf '%s\\n' "$compressed" | grep -q 'with spectral peaks' || {
+        echo 'M4A decode produced no analysis result' >&2
+        exit 1
+    }
+fi
+
 result=$(./nospeaker --analyze "$work/silence.wav")
 printf '%s\n' "$result"
 printf '%s\n' "$result" | grep -q 'No audible spectral peaks detected' || {
