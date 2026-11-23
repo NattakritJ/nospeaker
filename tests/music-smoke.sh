@@ -1,5 +1,5 @@
 #!/bin/sh
-# macOS-only: checks decoding, FFT peak detection, bass octave-shifting and silence.
+# macOS-only: checks decoding, FFT peaks, bass shifting, EQ ranking and silence.
 # No Force Touch trackpad is required because --analyze does not open the motor.
 set -eu
 cd "$(dirname "$0")/.."
@@ -18,6 +18,16 @@ for name, freq in [('a440.wav', 440), ('bass80.wav', 80), ('silence.wav', 0)]:
         values = (int(12000 * math.sin(2 * math.pi * freq * i / rate))
                   if freq else 0 for i in range(rate // 2))
         w.writeframes(b''.join(struct.pack('<h', v) for v in values))
+# Two competing notes: 440 Hz is stronger in the source, but the optional
+# trackpad profile should select the more efficiently radiated ~1 kHz note.
+with wave.open(os.path.join(base, 'duo.wav'), 'wb') as w:
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    values = (int(14000 * math.sin(2 * math.pi * 440 * i / rate)
+                  + 10000 * math.sin(2 * math.pi * 1047 * i / rate))
+              for i in range(rate // 2))
+    w.writeframes(b''.join(struct.pack('<h', v) for v in values))
 PY
 
 for entry in 'a440.wav:430:450' 'bass80.wav:150:170'; do
@@ -33,6 +43,25 @@ for entry in 'a440.wav:430:450' 'bass80.wav:150:170'; do
         exit 1
     }
 done
+
+# A/B baseline: the old weighting and a truly flat spectrum select 440 Hz.
+# The heuristic trackpad EQ should instead prefer the ~1 kHz resonance.
+for mode in flat original trackpad; do
+    result=$(./nospeaker --analyze "$work/duo.wav" --tones 1 --eq "$mode")
+    printf '%s\n' "$result"
+    hz=$(printf '%s\n' "$result" | awk '/First dominant frequency:/ {print $(NF-1)}')
+    if [ "$mode" = "trackpad" ]; then lo=1027; hi=1067
+    else lo=420; hi=460
+    fi
+    awk -v hz="$hz" -v lo="$lo" -v hi="$hi" 'BEGIN { if (!(hz >= lo && hz <= hi)) exit 1 }' || {
+        echo "Unexpected dominant pitch for --eq $mode: ${hz:-missing} Hz" >&2
+        exit 1
+    }
+done
+if ./nospeaker --analyze "$work/duo.wav" --eq invalid >/dev/null 2>&1; then
+    echo 'Invalid EQ profile was accepted' >&2
+    exit 1
+fi
 
 # A real compressed decoder path is essential: PCM-only smoke tests will
 # not exercise AAC's packet padding and estimated frame counts.
@@ -51,17 +80,6 @@ for name in a440-aac.m4a a440-alac.m4a; do
         exit 1
     }
 done
-
-# Exercise the compressed-audio decoder; MP4/AAC duration may be an estimate.
-if command -v afconvert >/dev/null 2>&1; then
-    afconvert -f m4af -d aac -b 96000 "$work/a440.wav" "$work/a440.m4a"
-    compressed=$(./nospeaker --analyze "$work/a440.m4a")
-    printf '%s\\n' "$compressed"
-    printf '%s\\n' "$compressed" | grep -q 'with spectral peaks' || {
-        echo 'M4A decode produced no analysis result' >&2
-        exit 1
-    }
-fi
 
 result=$(./nospeaker --analyze "$work/silence.wav")
 printf '%s\n' "$result"
