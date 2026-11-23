@@ -578,7 +578,18 @@ func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
             // Never ask for more frames than the file reports remaining.
             let remaining = audio.length - audio.framePosition
             let requested = AVAudioFrameCount(min(Int64(buffer.frameCapacity), remaining))
-            try audio.read(into: buffer, frameCount: requested)
+            do {
+                try audio.read(into: buffer, frameCount: requested)
+            } catch {
+                let nsError = error as NSError
+                // Compressed audio often reports an estimated frame count that is
+                // longer than the number of frames its decoder can actually read.
+                // OSStatus -39 is eofErr: end playback if valid PCM was decoded.
+                if nsError.domain == NSOSStatusErrorDomain && nsError.code == -39 && totalSamples > 0 {
+                    break
+                }
+                throw error
+            }
             let readCount = Int(buffer.frameLength)
             if readCount == 0 { break }
             guard let data = buffer.floatChannelData else { fail("Audio decoder didn't return floating-point PCM.") }
