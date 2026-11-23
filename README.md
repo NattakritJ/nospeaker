@@ -138,32 +138,41 @@ line as it speaks.
 
 **The code.** One Swift file, [nospeaker.swift](nospeaker.swift), with no dependencies.
 
+## 06 / caveats
+
+- **Is it safe?** It never drives the motor past its normal maximum strength. Going past it is possible and
+  louder, but the driver starts to stall, so nospeaker doesn't.
+- MultitouchSupport is private and undocumented, so a macOS update could break this.
+
+The MultitouchSupport function names were learned from the open-source Tactile project. Everything else was
+measured on a MacBook.
+
 ## 07 / experimental: play audio through the trackpad
 
-The new \`--play\` mode takes a normal audio file, decodes it with AVFoundation, runs a windowed
+The new `--play` mode takes a normal audio file, decodes it with AVFoundation, runs a windowed
 FFT via Accelerate/vDSP, and chooses the 1–6 strongest **separated spectral peaks** for each
 20 ms playback frame. Frequencies below 100 Hz are shifted up by octaves, frequencies
 above 3,950 Hz are dropped, and the frame energy controls loudness. It then synthesizes
 those tones with the **same haptic motor** used by the original demo.
 
-\`\`\`sh
+```sh
 ./build.sh
 ./nospeaker --play "music.wav"
 ./nospeaker --play "music.mp3" --tones 3 --level 0.30
 ./nospeaker --play "music.m4a" --tones 6 --level 0.45
-\`\`\`
+```
 
-\`--tones\` accepts 1–6 simultaneous tones (default 4), and \`--level\` accepts 0.05–0.60
+`--tones` accepts 1–6 simultaneous tones (default 4), and `--level` accepts 0.05–0.60
 (default 0.40). Stop playback immediately with **Ctrl-C**. Supported input formats
 depend on macOS decoders (WAV, MP3, M4A/AAC, AIFF are typical). Stereo is mixed to mono.
 
 **Inspect without using the motor** (also works on a Mac without a Force Touch trackpad):
 
-\`\`\`sh
+```sh
 ./nospeaker --analyze "music.wav"
 ./nospeaker --analyze "music.wav" --tones 6
 sh tests/music-smoke.sh  # after ./build.sh, requires Python 3
-\`\`\`
+```
 
 **Know the limitations.** This is *spectral resynthesis*, not real speaker/PCM playback:
 the motor only plays a few sine tones per frame, and the glass has a narrow, uneven
@@ -173,15 +182,6 @@ speaker. The 0.60 level cap reduces the drive relative to the API's normal maxim
 but continuous-use safety and wear have **not been validated**. Start with short,
 quiet clips, keep the Mac on a stable surface, and don't leave playback unattended.
 The private MultitouchSupport API may break with macOS updates.
-
-## 06 / caveats
-
-- **Is it safe?** It never drives the motor past its normal maximum strength. Going past it is possible and
-  louder, but the driver starts to stall, so nospeaker doesn't.
-- MultitouchSupport is private and undocumented, so a macOS update could break this.
-
-The MultitouchSupport function names were learned from the open-source Tactile project. Everything else was
-measured on a MacBook.
 
 ```text
 ──────────────────────  thanks for listening  ───────────────────────
