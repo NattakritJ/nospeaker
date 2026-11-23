@@ -34,6 +34,24 @@ for entry in 'a440.wav:430:450' 'bass80.wav:150:170'; do
     }
 done
 
+# A real compressed decoder path is essential: PCM-only smoke tests will
+# not exercise AAC's packet padding and estimated frame counts.
+if ! command -v afconvert >/dev/null 2>&1; then
+    echo "afconvert is required on macOS to test AAC and ALAC decoding" >&2
+    exit 1
+fi
+afconvert -f m4af -d aac "$work/a440.wav" "$work/a440-aac.m4a"
+afconvert -f m4af -d alac "$work/a440.wav" "$work/a440-alac.m4a"
+for name in a440-aac.m4a a440-alac.m4a; do
+    result=$(./nospeaker --analyze "$work/$name")
+    printf '%s\n' "$result"
+    hz=$(printf '%s\n' "$result" | awk '/First dominant frequency:/ {print $(NF-1)}')
+    awk -v hz="$hz" 'BEGIN { if (!(hz >= 425 && hz <= 455)) exit 1 }' || {
+        echo "Compressed audio decode or pitch check failed for $name: ${hz:-missing} Hz" >&2
+        exit 1
+    }
+done
+
 result=$(./nospeaker --analyze "$work/silence.wav")
 printf '%s\n' "$result"
 printf '%s\n' "$result" | grep -q 'No audible spectral peaks detected' || {
