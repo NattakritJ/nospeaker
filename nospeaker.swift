@@ -527,7 +527,12 @@ func analyseMusicFile(_ path: String, tones: Int) -> MusicAnalysis {
     }
     defer { vDSP_destroy_fftsetup(setup) }
     let hopSamples = max(1, Int((rate * 0.020).rounded()))
-    let window = (0..<n).map { Float(0.5 - 0.5 * cos(2 * .pi * Double($0) / Double(n - 1))) }
+    var window = [Float](repeating: 0, count: n)
+    for index in 0..<n {
+        let phase: Double = 2.0 * Double.pi * Double(index) / Double(n - 1)
+        let weight: Double = 0.5 * (1.0 - cos(phase))
+        window[index] = Float(weight)
+    }
     var windowed = [Float](repeating: 0, count: n)
     var real = [Float](repeating: 0, count: n / 2)
     var imag = [Float](repeating: 0, count: n / 2)
